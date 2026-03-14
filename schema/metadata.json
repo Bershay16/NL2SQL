@@ -1,0 +1,68 @@
+{
+  "tables": {
+    "customers": {
+      "columns": [
+        "customer_id",
+        "first_name",
+        "last_name",
+        "email",
+        "phone",
+        "city",
+        "created_at"
+      ],
+      "primary_key": "customer_id",
+      "foreign_keys": {}
+    },
+    "orders": {
+      "columns": [
+        "order_id",
+        "customer_id",
+        "rep_id",
+        "order_date",
+        "total_amount"
+      ],
+      "primary_key": "order_id",
+      "foreign_keys": {
+        "customer_id": "customers.customer_id",
+        "rep_id": "sales_reps.rep_id"
+      }
+    },
+    "sales_reps": {
+      "columns": [
+        "rep_id",
+        "rep_name",
+        "email",
+        "region",
+        "hire_date"
+      ],
+      "primary_key": "rep_id",
+      "foreign_keys": {}
+    },
+    "order_items": {
+      "columns": [
+        "order_item_id",
+        "order_id",
+        "product_id",
+        "quantity",
+        "price"
+      ],
+      "primary_key": "order_item_id",
+      "foreign_keys": {
+        "order_id": "orders.order_id",
+        "product_id": "products.product_id"
+      }
+    },
+    "products": {
+      "columns": [
+        "product_id",
+        "product_name",
+        "category",
+        "price",
+        "stock_quantity",
+        "created_at"
+      ],
+      "primary_key": "product_id",
+      "foreign_keys": {}
+    }
+  }
+}
