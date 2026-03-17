@@ -1,370 +1,291 @@
-import networkx as nx
+"""
+Single-table SQL Generator.
+
+Takes entities + intent dicts and produces a valid SQL string.
+No JOIN logic — operates on exactly one table.
+Uses metadata data_types to intelligently pick aggregation targets
+and GROUP BY columns.
+"""
+
 from sqlglot import parse_one
+
 
 class SQLGenerator:
     """
-    Schema-agnostic SQL generator.
-    Accepts entities + intent dicts and produces a valid single-line SQL string.
+    Schema-aware, single-table SQL generator.
     """
-    AGG_FUNCS = {"count", "sum", "avg", "max", "min"}
 
-    def __init__(self, metadata=None):
-        # Schema metadata used for fallback column discovery
+    def __init__(self, metadata: dict | None = None):
         self._metadata = metadata or {}
-        self._table_columns = {
-            t: set(info["columns"])
-            for t, info in self._metadata.get("tables", {}).items()
-        }
-        self._date_cols = {}   # table → best date column
-        self._label_cols = {}  # table → [name-like columns]
-        date_hints  = ["date", "time", "created", "modified", "timestamp", "_at"]
-        # Only include human-readable identifier columns in GROUP BY label set
-        # city/email/region are excluded to avoid over-grouping
-        label_hints = ["_name", "title", "label", "category", "description"]
-        for tbl, cols in self._table_columns.items():
-            for col in cols:
-                cl = col.lower()
-                if any(h in cl for h in date_hints) and tbl not in self._date_cols:
-                    self._date_cols[tbl] = col
-            self._label_cols[tbl] = [
-                col for col in cols
-                if any(h in col.lower() for h in label_hints)
-            ]
+        self._tables = self._metadata.get("tables", {})
 
-    def generate(self, entities, intent, graph=None):
-        tables     = list(entities.get("tables", []))
-        columns    = list(entities.get("columns", []))
-        filters    = list(entities.get("filters", []))
-        comp_agg   = entities.get("composite_agg")
+        # Pre-compute column type info per table
+        self._col_types: dict[str, dict[str, str]] = {}   # table → {col: data_type}
+        self._numeric_cols: dict[str, list[str]] = {}      # table → [numeric cols]
+        self._text_cols: dict[str, list[str]] = {}          # table → [text cols]
+        self._date_cols: dict[str, list[str]] = {}          # table → [date cols]
+        self._label_cols: dict[str, list[str]] = {}         # table → [name-like cols]
+        self._pk_col: dict[str, str | None] = {}            # table → pk
 
-        agg_func   = (intent.get("aggregation") or "").upper()
-        order_dir  = intent.get("order_by")
-        limit_val  = intent.get("limit")
-        having     = intent.get("having")
-        temporal   = intent.get("temporal")
-        left_join  = intent.get("left_join", False)
+        for tbl, info in self._tables.items():
+            cols_raw = info.get("columns", {})
+            # Handle old list format
+            if isinstance(cols_raw, list):
+                cols_raw = {c: {"data_type": "text"} for c in cols_raw}
 
-        # ------------------------------------------------------------------ #
-        # 1. Infer tables from columns when none detected
-        # ------------------------------------------------------------------ #
-        if not tables and columns:
-            for col in columns:
-                for t in col.get("tables", []):
-                    if t not in tables:
-                        tables.append(t)
+            types = {}
+            numeric, text, date, label = [], [], [], []
+            pk = None
 
-        if not tables:
-            return "SELECT * FROM unknown_table;"
+            for col, meta in cols_raw.items():
+                dt = meta.get("data_type", "text")
+                types[col] = dt
 
-        # ------------------------------------------------------------------ #
-        # 2. Expand tables via shortest-path JOIN resolution
-        # ------------------------------------------------------------------ #
-        aliases = {}
-        join_clauses = []
+                if meta.get("is_primary_key"):
+                    pk = col
 
-        def get_alias(table):
-            if table not in aliases:
-                aliases[table] = f"t{len(aliases)+1}"
-            return aliases[table]
-
-        primary = tables[0]
-        get_alias(primary)
-
-        if len(tables) > 1 and graph:
-            covered = {primary}
-            # Expand to cover all requested tables via shortest path
-            remaining = list(tables[1:])
-            iterations = 0
-            while remaining and iterations < 10:
-                iterations += 1
-                target = remaining.pop(0)
-                if target in covered:
-                    continue
-                try:
-                    path = nx.shortest_path(graph, primary, target)
-                except Exception:
-                    # try any covered node as bridge
-                    path = None
-                    for cv in covered:
-                        try:
-                            path = nx.shortest_path(graph, cv, target)
-                            break
-                        except Exception:
-                            continue
-                    if path is None:
-                        path = [primary, target]
-
-                for i in range(len(path) - 1):
-                    u, v = path[i], path[i+1]
-                    if v in covered:
-                        continue
-                    covered.add(v)
-                    get_alias(v)
-                    edge = (graph.get_edge_data(u, v) or {})
-                    on_cond = edge.get("on", f"{u}.id = {v}.{u}_id")
-                    on_alias = on_cond
-                    for tbl, al in aliases.items():
-                        on_alias = on_alias.replace(f"{tbl}.", f"{al}.")
-
-                    join_type = "LEFT JOIN" if left_join else "JOIN"
-                    join_clauses.append(
-                        f"{join_type} {v} {aliases[v]} ON {on_alias}"
-                    )
-
-        # Make sure every table has an alias
-        for t in tables:
-            get_alias(t)
-
-        # Resolve alias for a column (check which table it belongs to)
-        def col_alias(col_name, col_tables):
-            for t in tables:
-                if t in (col_tables or []):
-                    return f"{aliases[t]}.{col_name}"
-            return f"{aliases[primary]}.{col_name}"
-
-        # ------------------------------------------------------------------ #
-        # 3. Build SELECT list
-        # ------------------------------------------------------------------ #
-        select_parts = []
-        NUMERIC_HINTS = ["amount", "total", "price", "revenue", "cost", "salary", "balance",
-                         "score", "rate", "value", "fee", "tax", "discount"]
-        NAME_HINTS    = ["name", "title", "label", "description", "city", "region",
-                         "category", "email"]
-
-        def get_label_cols_for_table(tbl):
-            """Name-like columns from a single table (for GROUP BY)."""
-            return [
-                f"{aliases[tbl]}.{col}"
-                for col in self._label_cols.get(tbl, [])
-            ]
-
-        def auto_numeric_col(tbl):
-            """Find a numeric-sounding column in a table from schema."""
-            for col in self._table_columns.get(tbl, []):
-                if any(h in col.lower() for h in NUMERIC_HINTS):
-                    return col
-            return None
-
-        def auto_pk_col(tbl):
-            """Find the primary key column of a table."""
-            info = self._metadata.get("tables", {}).get(tbl, {})
-            return info.get("primary_key")
-
-        if agg_func:
-            agg_target_ref = None
-            # ---- Composite: SUM(qty * price) ----
-            if comp_agg == "quantity_x_price":
-                qty_alias   = col_alias("quantity", self.columns_for("quantity", columns))
-                price_alias = col_alias("price",    self.columns_for("price",    columns))
-                select_parts.append(f"SUM({qty_alias} * {price_alias})")
-
-            # ---- COUNT: prefer PK of primary table ----
-            elif agg_func == "COUNT":
-                if columns:
-                    target_col = self._pick_agg_column(columns, agg_func)
-                    agg_target_ref = col_alias(target_col['column'], target_col['tables'])
-                    select_parts.append(f"COUNT({agg_target_ref})")
+                if dt in ("numeric", "integer", "float", "real", "money"):
+                    if not meta.get("is_primary_key"):
+                        numeric.append(col)
+                elif dt in ("date", "timestamp", "timestamptz"):
+                    date.append(col)
                 else:
-                    pk = auto_pk_col(primary)
-                    if pk:
-                        select_parts.append(f"COUNT({aliases[primary]}.{pk})")
-                    else:
-                        select_parts.append("COUNT(*)")
+                    text.append(col)
+                    # "name"-like columns are good for GROUP BY display
+                    name_hints = ("name", "title", "label", "category",
+                                  "description", "department", "type")
+                    if any(h in col.lower() for h in name_hints):
+                        label.append(col)
 
-            # ---- SUM/AVG/MAX/MIN: find numeric col from schema if not explicitly given ----
-            else:
-                if columns:
-                    target_col = self._pick_agg_column(columns, agg_func)
-                    agg_target_ref = col_alias(target_col['column'], target_col['tables'])
-                    select_parts.append(f"{agg_func}({agg_target_ref})")
-                else:
-                    # Auto-search all joined tables for a numeric column
-                    num_col, num_tbl = None, None
-                    for tbl in tables:
-                        nc = auto_numeric_col(tbl)
-                        if nc:
-                            num_col, num_tbl = nc, tbl
-                            break
-                    if num_col and num_tbl:
-                        select_parts.append(f"{agg_func}({aliases[num_tbl]}.{num_col})")
-                    else:
-                        select_parts.append(f"{agg_func}(*)")
+            self._col_types[tbl] = types
+            self._numeric_cols[tbl] = numeric
+            self._text_cols[tbl] = text
+            self._date_cols[tbl] = date
+            self._label_cols[tbl] = label
+            self._pk_col[tbl] = pk
 
-            # ---- First add explicitly matched non-ID columns ----
-            explicit_group_cols = 0
-            for col in columns:
-                ref = col_alias(col["column"], col["tables"])
-                if ref not in select_parts and ref != agg_target_ref:
-                    select_parts.append(ref)
-                    explicit_group_cols += 1
+    # ------------------------------------------------------------------ #
+    def generate(self, entities: dict, intent: dict, **_kwargs) -> str:
+        table   = entities.get("table")
+        columns = list(entities.get("columns", []))
+        filters = list(entities.get("filters", []))
 
-            # ---- If no explicit columns were added, use label columns from "grouping" table ----
-            if explicit_group_cols == 0:
-                group_tbl = tables[-1] if len(tables) > 1 else tables[0]
-                for lc in get_label_cols_for_table(group_tbl):
-                    if lc not in select_parts:
-                        select_parts.append(lc)
+        agg      = (intent.get("aggregation") or "").upper()
+        order    = intent.get("order_by")           # "ASC" | "DESC" | None
+        limit    = intent.get("limit")              # int | None
+        having   = intent.get("having")             # {"op": ">", "value": "5"} | None
+        temporal = intent.get("temporal")            # "year" | "month" | None
+        group_hint = intent.get("group_by_hint", False)
 
+        if not table:
+            return "-- ERROR: no table could be resolved from the query"
 
+        col_types = self._col_types.get(table, {})
+        pk = self._pk_col.get(table)
 
-        elif temporal:
-            date_col = self._find_date_col_for_tables(tables)
+        # ---------------------------------------------------------------- #
+        # 1. SELECT
+        # ---------------------------------------------------------------- #
+        select_parts: list[str] = []
+        group_cols: list[str] = []
+        agg_expr: str | None = None
+
+        if temporal:
+            # "per year" / "per month"
+            date_col = self._pick_date_col(table)
             select_parts.append(f"EXTRACT({temporal.upper()} FROM {date_col})")
             select_parts.append("COUNT(*)")
+            group_cols.append(select_parts[0])
+            agg_expr = "COUNT(*)"
+
+        elif agg:
+            agg_target = self._pick_agg_target(agg, columns, table)
+            agg_expr = f"{agg}({agg_target})"
+            select_parts.append(agg_expr)
+
+            # Add grouping columns
+            group_cols = self._pick_group_cols(
+                agg, columns, filters, table, group_hint,
+            )
+            select_parts.extend(group_cols)
 
         elif columns:
-            seen = set()
-            for col in columns:
-                ref = col_alias(col["column"], col["tables"])
-                if ref not in seen:
-                    select_parts.append(ref)
-                    seen.add(ref)
+            # Explicit columns only
+            filter_cols = {f["column"] for f in filters}
+            for c in columns:
+                col = c["column"]
+                if col not in filter_cols and col not in select_parts:
+                    select_parts.append(col)
+            # If all columns were filter columns, fall back to *
+            if not select_parts:
+                select_parts.append("*")
+
+            # For ranking queries (ORDER+LIMIT), include label columns
+            # so we see WHO has the top salary, not just the salary value
+            if order and limit and select_parts != ["*"]:
+                all_numeric = all(
+                    col_types.get(s, "text") in ("numeric", "integer", "float", "money")
+                    for s in select_parts
+                )
+                if all_numeric:
+                    for lc in self._label_cols.get(table, []):
+                        if lc not in select_parts:
+                            select_parts.insert(0, lc)
         else:
-            select_parts.append(f"{aliases[primary]}.*")
+            select_parts.append("*")
 
-        # ------------------------------------------------------------------ #
-        # 4. FROM + JOIN
-        # ------------------------------------------------------------------ #
-        parts = [f"SELECT {', '.join(select_parts)}",
-                 f"FROM {primary} {aliases[primary]}"]
-        parts.extend(join_clauses)
+        # ---------------------------------------------------------------- #
+        # 2. FROM
+        # ---------------------------------------------------------------- #
+        from_clause = table
 
-        # ------------------------------------------------------------------ #
-        # 5. WHERE (with LEFT JOIN NULL check for "never ordered" queries)
-        # WHERE + LEFT JOIN IS NULL
-        where_conds = []
+        # ---------------------------------------------------------------- #
+        # 3. WHERE
+        # ---------------------------------------------------------------- #
+        where_conds: list[str] = []
         for f in filters:
-            col_ref = col_alias(f["column"], [])
+            col = f["column"]
+            op  = f["operator"]
             val = f["value"]
-            if not str(val).lstrip("-").replace(".", "").isnumeric():
-                val = f"'{val}'"
-            where_conds.append(f"{col_ref} {f['operator']} {val}")
+            col_type = col_types.get(col, "text")
 
-        if left_join and len(tables) > 1:
-            # The last joined table's primary key IS NULL ("never ordered")
-            last_t = tables[-1]
-            last_info = self._metadata.get("tables", {}).get(last_t, {})
-            pk = last_info.get("primary_key")
-            null_col = f"{aliases[last_t]}.{pk}" if pk else f"{aliases[last_t]}.*"
-            where_conds.append(f"{null_col} IS NULL")
+            # Handle year filters for date/timestamp columns:
+            # "hired > 2020" -> EXTRACT(YEAR FROM hire_date) > 2020
+            is_year_val = (
+                str(val).isdigit() 
+                and len(str(val)) == 4 
+                and 1900 <= int(val) <= 2100
+            )
+            if col_type in ("date", "timestamp") and is_year_val:
+                where_conds.append(f"EXTRACT(YEAR FROM {col}) {op} {val}")
+                continue
+
+            # Quote non-numeric values
+            if not str(val).lstrip("-").replace(".", "").replace(",", "").isdigit():
+                val = f"'{val}'"
+
+            where_conds.append(f"{col} {op} {val}")
+
+        # ---------------------------------------------------------------- #
+        # 4. GROUP BY
+        # ---------------------------------------------------------------- #
+        # (group_cols already built above)
+
+        # ---------------------------------------------------------------- #
+        # 5. HAVING
+        # ---------------------------------------------------------------- #
+        having_clause: str | None = None
+        if having and agg_expr:
+            having_clause = f"{agg_expr} {having['op']} {having['value']}"
+
+        # ---------------------------------------------------------------- #
+        # 6. ORDER BY
+        # ---------------------------------------------------------------- #
+        order_clause: str | None = None
+        if order:
+            if agg_expr:
+                order_clause = f"{agg_expr} {order}"
+            elif columns:
+                # Prefer numeric columns for ordering
+                order_col = self._pick_order_col(columns, table)
+                order_clause = f"{order_col} {order}"
+            else:
+                # Fallback: first numeric column or PK
+                nc = self._numeric_cols.get(table, [])
+                order_col = nc[0] if nc else (pk or select_parts[0])
+                order_clause = f"{order_col} {order}"
+
+        # ---------------------------------------------------------------- #
+        # 7. Assemble
+        # ---------------------------------------------------------------- #
+        parts = [f"SELECT {', '.join(select_parts)}"]
+        parts.append(f"FROM {from_clause}")
 
         if where_conds:
             parts.append(f"WHERE {' AND '.join(where_conds)}")
+        if group_cols:
+            parts.append(f"GROUP BY {', '.join(group_cols)}")
+        if having_clause:
+            parts.append(f"HAVING {having_clause}")
+        if order_clause:
+            parts.append(f"ORDER BY {order_clause}")
+        if limit:
+            parts.append(f"LIMIT {limit}")
 
-        # ------------------------------------------------------------------ #
-        # 6. GROUP BY — all non-aggregated items in SELECT
-        # ------------------------------------------------------------------ #
-        group_by_cols = []
-        if agg_func or temporal:
-            for item in select_parts:
-                if not any(fn in item.upper() for fn in ["SUM(", "COUNT(", "AVG(", "MAX(", "MIN(", "EXTRACT("]):
-                    group_by_cols.append(item)
-            if group_by_cols:
-                parts.append(f"GROUP BY {', '.join(group_by_cols)}")
-            elif temporal:
-                parts.append(f"GROUP BY EXTRACT({temporal.upper()} FROM {self._find_date_col_for_tables(tables)})")
-            elif having and agg_func:
-                # HAVING requires GROUP BY — use label cols from the non-primary (grouping) table
-                group_tbl = tables[-1] if len(tables) > 1 else tables[0]
-                fallback_labels = [
-                    f"{aliases[group_tbl]}.{col}"
-                    for col in self._label_cols.get(group_tbl, [])
-                ]
-                if fallback_labels:
-                    parts.append(f"GROUP BY {', '.join(fallback_labels)}")
-                else:
-                    # Last resort: group by primary key
-                    pk = self._metadata.get("tables", {}).get(group_tbl, {}).get("primary_key")
-                    if pk:
-                        parts.append(f"GROUP BY {aliases[group_tbl]}.{pk}")
+        raw = " ".join(parts)
 
-        # 7. HAVING
-        if having and agg_func:
-            having_expr = select_parts[0]
-            parts.append(f"HAVING {having_expr} {having['op']} {having['value']}")
-
-
-        # ------------------------------------------------------------------ #
-        # 8. ORDER BY (always after GROUP/HAVING)
-        # --------------------------------------------------------------        # ORDER BY
-        if order_dir:
-            if agg_func and select_parts:
-                # Order by the aggregated expression (first item)
-                order_col = select_parts[0]
-            elif columns:
-                oc = self._pick_order_column(columns)
-                order_col = col_alias(oc["column"], oc["tables"])
-            else:
-                # Fallback to a numeric column, else primary key
-                nc, nt = None, None
-                for tbl in tables:
-                    c = auto_numeric_col(tbl)
-                    if c:
-                        nc, nt = c, tbl
-                        break
-                if nc:
-                    order_col = f"{aliases[nt]}.{nc}"
-                else:
-                    pk = auto_pk_col(primary)
-                    order_col = f"{aliases[primary]}.{pk}" if pk else f"{aliases[primary]}.id"
-
-            parts.append(f"ORDER BY {order_col} {order_dir}")
-
-        # LIMIT
-        if limit_val:
-            parts.append(f"LIMIT {limit_val}")
-
-        query_str = " ".join(parts)
+        # Validate / pretty-print via sqlglot
         try:
-            return parse_one(query_str).sql(pretty=False) + ";"
-        except Exception as e:
-            return query_str + ";  -- parse error: " + str(e)
+            return parse_one(raw).sql(pretty=False) + ";"
+        except Exception:
+            return raw + ";"
 
     # ------------------------------------------------------------------ #
-    # Helpers
+    #  Private helpers
     # ------------------------------------------------------------------ #
-    def columns_for(self, name, columns):
+    def _pick_agg_target(
+        self, agg: str, columns: list[dict], table: str,
+    ) -> str:
+        """Choose the right column to aggregate."""
+        numeric = self._numeric_cols.get(table, [])
+
+        if agg == "COUNT":
+            pk = self._pk_col.get(table)
+            return pk if pk else "*"
+
+        # SUM / AVG / MAX / MIN → need a numeric column
+        # 1. From explicitly matched columns
         for c in columns:
-            if c["column"] == name:
-                return c["tables"]
+            col = c["column"]
+            dt = self._col_types.get(table, {}).get(col, "text")
+            if dt in ("numeric", "integer", "float", "real", "money"):
+                return col
+
+        # 2. First numeric column in schema
+        if numeric:
+            return numeric[0]
+
+        # 3. Absolute fallback
+        return "*"
+
+    def _pick_group_cols(
+        self, agg: str, columns: list[dict], filters: list[dict],
+        table: str, group_hint: bool,
+    ) -> list[str]:
+        """Determine GROUP BY columns for an aggregation query."""
+        filter_col_set = {f["column"] for f in filters}
+        numeric_set = set(self._numeric_cols.get(table, []))
+
+        # Explicitly mentioned non-numeric, non-filter columns → GROUP BY
+        explicit: list[str] = []
+        for c in columns:
+            col = c["column"]
+            if col not in numeric_set and col not in filter_col_set:
+                pk = self._pk_col.get(table)
+                if col != pk:
+                    explicit.append(col)
+
+        if explicit:
+            return explicit
+
+        # If "per department", "each city" → use label/text columns from nouns
+        if group_hint:
+            labels = self._label_cols.get(table, [])
+            if labels:
+                return [labels[0]]
+
         return []
 
-    def _pick_agg_column(self, columns, agg_func):
-        numeric_hints = ["amount", "price", "total", "revenue", "salary", "cost",
-                         "quantity", "count", "balance", "score", "rate", "value"]
-        if agg_func in ("SUM", "AVG", "MAX", "MIN"):
-            for col in columns:
-                if any(h in col["column"].lower() for h in numeric_hints):
-                    return col
-        return columns[0]
-
-    def _pick_order_column(self, columns):
-        numeric_hints = ["amount", "price", "total", "revenue", "date", "quantity",
-                         "count", "score", "rate", "value"]
-        for col in columns:
-            if any(h in col["column"].lower() for h in numeric_hints):
+    def _pick_order_col(self, columns: list[dict], table: str) -> str:
+        """Pick the best column for ORDER BY (prefer numeric)."""
+        for c in columns:
+            col = c["column"]
+            dt = self._col_types.get(table, {}).get(col, "text")
+            if dt in ("numeric", "integer", "float", "real", "money"):
                 return col
-        return columns[0]
+        return columns[0]["column"]
 
-    def _find_date_col_for_tables(self, tables):
-        """Find the best date column from the schema for the given tables."""
-        date_hints = ["date", "time", "created", "modified", "timestamp", "_at"]
-        for tbl in tables:
-            for col in self._table_columns.get(tbl, []):
-                if any(h in col.lower() for h in date_hints):
-                    al = self._get_alias_for(tbl)
-                    return f"{al}.{col}" if al else col
-        return "created_at"
-
-    def _get_alias_for(self, tbl):
-        """Return the alias for a table if it was registered during generate()."""
-        # Aliases are local to generate(); this is a best-effort hint.
-        return None
-
-    def _find_date_column(self, columns, tables):
-        """Legacy: find date col from matched columns."""
-        date_hints = ["date", "time", "created", "modified", "timestamp", "at"]
-        for col in columns:
-            if any(h in col["column"].lower() for h in date_hints):
-                return col["column"]
-        return self._find_date_col_for_tables(tables)
+    def _pick_date_col(self, table: str) -> str:
+        """Pick the best date/timestamp column."""
+        dc = self._date_cols.get(table, [])
+        return dc[0] if dc else "created_at"

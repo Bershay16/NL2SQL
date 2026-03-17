@@ -1,68 +1,97 @@
 {
   "tables": {
-    "customers": {
-      "columns": [
-        "customer_id",
-        "first_name",
-        "last_name",
-        "email",
-        "phone",
-        "city",
-        "created_at"
-      ],
-      "primary_key": "customer_id",
-      "foreign_keys": {}
-    },
-    "orders": {
-      "columns": [
-        "order_id",
-        "customer_id",
-        "rep_id",
-        "order_date",
-        "total_amount"
-      ],
-      "primary_key": "order_id",
-      "foreign_keys": {
-        "customer_id": "customers.customer_id",
-        "rep_id": "sales_reps.rep_id"
+    "employees": {
+      "description": "Contains employee records including personal and professional details",
+      "columns": {
+        "employee_id": {
+          "data_type": "integer",
+          "description": "Unique identifier for each employee",
+          "is_primary_key": true,
+          "sample_values": [1, 2, 3, 4, 5]
+        },
+        "first_name": {
+          "data_type": "text",
+          "description": "Employee first name",
+          "sample_values": ["John", "Jane", "Alice", "Bob", "Priya"],
+          "distinct_values": ["John", "Jane", "Alice", "Bob", "Priya", "Raj", "Sara", "Mike"]
+        },
+        "last_name": {
+          "data_type": "text",
+          "description": "Employee last name",
+          "sample_values": ["Doe", "Smith", "Johnson", "Brown", "Kumar"],
+          "distinct_values": ["Doe", "Smith", "Johnson", "Brown", "Kumar", "Patel", "Lee"]
+        },
+        "email": {
+          "data_type": "text",
+          "description": "Employee email address",
+          "sample_values": ["john@company.com", "jane@company.com"]
+        },
+        "phone_number": {
+          "data_type": "text",
+          "description": "Employee contact phone number",
+          "sample_values": ["+91-9876543210", "+1-555-0123"]
+        },
+        "date_of_birth": {
+          "data_type": "date",
+          "description": "Employee date of birth",
+          "sample_values": ["1990-05-15", "1985-11-20"]
+        },
+        "gender": {
+          "data_type": "text",
+          "description": "Employee gender",
+          "sample_values": ["Male", "Female"],
+          "distinct_values": ["Male", "Female"]
+        },
+        "hire_date": {
+          "data_type": "date",
+          "description": "Date when the employee was hired",
+          "sample_values": ["2020-01-15", "2019-06-01"]
+        },
+        "job_title": {
+          "data_type": "text",
+          "description": "Employee job title or role",
+          "sample_values": ["Software Engineer", "Manager", "Analyst", "Designer"],
+          "distinct_values": ["Software Engineer", "Manager", "Analyst", "Designer", "Director", "Intern", "Lead"]
+        },
+        "department": {
+          "data_type": "text",
+          "description": "Department the employee belongs to",
+          "sample_values": ["IT", "HR", "Finance", "Marketing", "Sales"],
+          "distinct_values": ["IT", "HR", "Finance", "Marketing", "Sales", "Engineering", "Operations"]
+        },
+        "salary": {
+          "data_type": "numeric",
+          "description": "Employee monthly or annual salary",
+          "sample_values": [50000, 75000, 60000, 90000, 45000]
+        },
+        "manager_id": {
+          "data_type": "integer",
+          "description": "ID of the employee's manager (self-referencing)",
+          "sample_values": [1, 2, null]
+        },
+        "address": {
+          "data_type": "text",
+          "description": "Employee residential address",
+          "sample_values": ["123 Main St", "456 Oak Ave"]
+        },
+        "city": {
+          "data_type": "text",
+          "description": "City where the employee lives",
+          "sample_values": ["Chennai", "Mumbai", "New York", "London"],
+          "distinct_values": ["Chennai", "Mumbai", "New York", "London", "Delhi", "Bangalore", "Tokyo"]
+        },
+        "country": {
+          "data_type": "text",
+          "description": "Country where the employee lives",
+          "sample_values": ["India", "USA", "UK", "Japan"],
+          "distinct_values": ["India", "USA", "UK", "Japan", "Germany", "France"]
+        },
+        "created_at": {
+          "data_type": "timestamp",
+          "description": "Record creation timestamp",
+          "sample_values": ["2024-01-15 10:30:00", "2024-02-20 14:45:00"]
+        }
       }
-    },
-    "sales_reps": {
-      "columns": [
-        "rep_id",
-        "rep_name",
-        "email",
-        "region",
-        "hire_date"
-      ],
-      "primary_key": "rep_id",
-      "foreign_keys": {}
-    },
-    "order_items": {
-      "columns": [
-        "order_item_id",
-        "order_id",
-        "product_id",
-        "quantity",
-        "price"
-      ],
-      "primary_key": "order_item_id",
-      "foreign_keys": {
-        "order_id": "orders.order_id",
-        "product_id": "products.product_id"
-      }
-    },
-    "products": {
-      "columns": [
-        "product_id",
-        "product_name",
-        "category",
-        "price",
-        "stock_quantity",
-        "created_at"
-      ],
-      "primary_key": "product_id",
-      "foreign_keys": {}
     }
   }
 }

@@ -1,0 +1,72 @@
+bershay@another-bershay:~/Projects/Mini_Project/nl2sql$ uv run python main.py
+Metadata file already exists. (U)se existing or (G)enerate new? [U/G]: u
+
+Initializing NL2SQL components...
+
+NL2SQL System Ready!
+Type 'exit' or 'quit' to stop.
+
+User Question: list employee hired after 2020
+
+Generated SQL:
+----------------------------------------
+SELECT * FROM employees WHERE EXTRACT(YEAR FROM hire_date) > 2020;
+----------------------------------------
+
+User Question: all employees
+
+Generated SQL:
+----------------------------------------
+SELECT * FROM employees;
+----------------------------------------
+
+User Question: list 3 employees
+
+Generated SQL:
+----------------------------------------
+SELECT * FROM employees;
+----------------------------------------
+
+User Question: list male employees
+
+Generated SQL:
+----------------------------------------
+SELECT * FROM employees WHERE gender = 'Male';
+----------------------------------------
+
+User Question: list all the manager
+
+Generated SQL:
+----------------------------------------
+SELECT * FROM employees WHERE job_title = 'Manager';
+----------------------------------------
+
+User Question: list the employees who is a manager and salary is more than 188888
+
+Generated SQL:
+----------------------------------------
+SELECT * FROM employees WHERE job_title = 'Manager' AND salary > 188888;
+----------------------------------------
+
+User Question: list the employees from finance
+
+Generated SQL:
+----------------------------------------
+SELECT * FROM employees WHERE department = 'Finance';
+----------------------------------------
+
+User Question: list the employees who dosent have a manager
+
+Generated SQL:
+----------------------------------------
+SELECT * FROM employees WHERE job_title = 'Manager';
+----------------------------------------
+
+User Question: employees from chennai
+
+Generated SQL:
+----------------------------------------
+SELECT * FROM employees WHERE city = 'Chennai';
+----------------------------------------
+
+User Question: 

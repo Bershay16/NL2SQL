@@ -1,7 +1,7 @@
 [project]
 name = "nl2sql"
 version = "0.1.0"
-description = "Add your description here"
+description = "Context-driven NL-to-SQL translation engine for single-table queries"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -9,7 +9,6 @@ dependencies = [
     "en-core-web-sm",
     "fastapi>=0.135.1",
     "httpx>=0.28.1",
-    "networkx>=3.6.1",
     "psycopg[binary]>=3.3.3",
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.2",
