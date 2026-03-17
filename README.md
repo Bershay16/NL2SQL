@@ -1,38 +1,35 @@
-# NL2SQL FastAPI Endpoint
+# NL2SQL Context-Aware Engine
 
-The project has been configured with a dynamic FastAPI endpoint that accepts both the Natural Language query and the Database Schema metadata as arguments for translation.
+A deterministic, context-driven Natural Language to SQL translation engine. Unlike traditional rule-based systems, this engine derives its understanding entirely from your database **metadata** (descriptions, data types, and sample values), allowing it to resolve filters and aggregations without any hardcoded column or table mappings.
 
 ## 🚀 Running the API
 
-Start the API server by running:
+Start the FastAPI server:
 ```bash
 uv run uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
-(Be aware: the first API request might take 1-2 seconds longer as spaCy initially loads in the background).
+*(Note: The first request may take a few seconds as the spaCy NLP model loads.)*
 
-## 📡 API Endpoint Details
+## 📡 API Usage
 
-- **URL:** `POST /translate`
-- **Content-Type:** `application/json`
+### `POST /translate`
 
-### Option 1: Valid Matching Query
-Send a natural language query with the JSON database describe mapping (the Tables & Columns format that models Postgres schemas).
+Accepts a natural language query and the database schema metadata.
 
-**Input Form:**
+**Request Structure:**
 ```json
 {
-  "query": "Show the top 3 customers who spent the most money",
+  "query": "list male employees hired after 2020",
   "metadata": {
     "tables": {
-      "customers": {
-        "columns": ["customer_id", "first_name", "last_name", "email", "city"],
-        "primary_key": "customer_id"
-      },
-      "orders": {
-        "columns": ["order_id", "customer_id", "order_date", "total_amount"],
-        "primary_key": "order_id",
-        "foreign_keys": {
-          "customer_id": "customers.customer_id"
+      "employees": {
+        "description": "Employee records and salary data",
+        "columns": {
+          "employee_id": { "data_type": "integer", "is_primary_key": true },
+          "first_name": { "data_type": "text", "description": "First name" },
+          "gender": { "data_type": "text", "distinct_values": ["Male", "Female"] },
+          "hire_date": { "data_type": "date", "description": "Joining date" },
+          "salary": { "data_type": "numeric" }
         }
       }
     }
@@ -40,42 +37,50 @@ Send a natural language query with the JSON database describe mapping (the Table
 }
 ```
 
-**Output Form (`200 OK`):**
-Because the schema successfully relates to the question, the system matches it and binds the proper SQL.
+**Response (`is_matching: true`):**
 ```json
 {
   "is_matching": true,
-  "sql_query": "SELECT SUM(t1.total_amount), t2.first_name, t2.last_name, t2.email, t2.city FROM orders AS t1 JOIN customers AS t2 ON t1.customer_id = t2.customer_id GROUP BY t2.first_name, t2.last_name, t2.email, t2.city ORDER BY SUM(t1.total_amount) DESC LIMIT 3;"
+  "sql_query": "SELECT * FROM employees WHERE gender = 'Male' AND EXTRACT(YEAR FROM hire_date) > 2020;"
 }
 ```
 
-### Option 2: Unrelated (Non-Matching) Query
-If the natural language query asks about something outside the provided schema database (e.g. asking about `"capital of France"` when the Postgres schema holds `"customers"`), it will be detected as invalid.
+---
 
-**Input Form:**
-```json
-{
-  "query": "What is the capital of France?",
-  "metadata": {
-    "tables": {
-      "customers": {
-        ...
-      }
-    }
-  }
-}
+## 🔥 Key Features
+
+### 1. Zero Hardcoding
+The engine has no built-in knowledge of your tables. It uses **Fuzzy Semantic Matching** against column descriptions and human-readable labels provided in the metadata.
+
+### 2. Auto-Filter Resolution
+By providing `distinct_values` or `sample_values`, the engine can automatically map user words to specific column values.
+*   *Input:* "employees from Chennai"
+*   *Detection:* Matches "Chennai" in `city` column metadata → `WHERE city = 'Chennai'`
+
+### 3. Smart Date/Time Logic
+Supports temporal comparisons like `after`, `since`, `before`, and `prior to`.
+*   *Input:* "hired after 2020"
+*   *Logic:* Detects `2020` as a year and `hire_date` as a date type → `EXTRACT(YEAR FROM hire_date) > 2020`
+
+### 4. Ranking & Aggregations
+Intelligently handles "Top N" queries and business aggregations:
+*   *Input:* "Top 5 employees by salary"
+*   *Result:* Automatically includes label columns (names/titles) for context → `SELECT first_name, last_name, salary FROM employees ORDER BY salary DESC LIMIT 5;`
+
+### 5. Hallucination Prevention
+If a query is completely unrelated to the schema (e.g., "What is the capital of France?"), the engine scores the relevance and returns `is_matching: false` rather than generating invalid queries.
+
+---
+
+## 🛠 Project Structure
+
+- `nlp/parser.py`: Pure linguistic analysis (parts-of-speech, named entities).
+- `nlp/entity_extractor.py`: Context-driven resolution of tables, columns, and values.
+- `query_builder/sql_generator.py`: Generates standards-compliant SQL using SQLAlchemy/sqlglot patterns.
+- `schema/inspector.py`: Tool to automatically generate the rich `metadata.json` from an existing DB.
+
+## 🧪 Testing
+Run the comprehensive test suite to verify 17+ different query patterns:
+```bash
+uv run python test_fastapi.py
 ```
-
-**Output Form (`200 OK`):**
-```json
-{
-  "is_matching": false,
-  "sql_query": null
-}
-```
-
-## ⚙️ How it Works Intemally
-1. The Postgres Database schema passed into `request.metadata` is dynamically pushed into the `EntityExtractor` and `SQLGenerator` memory classes.
-2. The endpoint checks how many exact Tables, Columns or Filters match in the context.
-3. If no matching Tables or context filters identify themselves, the API safely falls back indicating the question implies objects outside the Postgres context (`is_matching: false`).
-4. Provided it has semantic references, the query gets bundled into `SQLGenerator(request.metadata).generate()` and safely returns the valid SQL syntax.
