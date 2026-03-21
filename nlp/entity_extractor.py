@@ -13,22 +13,19 @@ KEY DESIGN PRINCIPLES:
 import re
 import json
 from rapidfuzz import process, fuzz
+from nlp.intelligence import DatabaseLinguist
 
 
-# ===================================================================== #
-#  INTENT CLASSIFIER
-# ===================================================================== #
 class IntentClassifier:
     """
     Detects SQL intent (aggregation, ordering, limit, having, temporal,
     grouping) from the raw NL text + parser analysis.
     """
 
-    # Aggregation concept → trigger phrases  (order = priority)
     _AGG_PATTERNS: list[tuple[str, list[str]]] = [
         ("count", [
-            "how many", "number of", "count of", "count the",
-            "total number", "total count",
+            "how many", "count of", "total count", "total records",
+            "number of records", "number of rows",
         ]),
         ("sum", [
             "total revenue", "total sales", "total amount", "total spent",
@@ -36,12 +33,15 @@ class IntentClassifier:
         ]),
         ("avg", ["average", "avg ", "mean "]),
         ("max", ["highest", "maximum", "max ", "most expensive", "largest",
-                 "greatest", "top salary", "top amount"]),
-        ("min", ["lowest", "minimum", "min ", "cheapest", "smallest"]),
+                 "greatest", "top salary", "top amount", "paid the most"]),
+        ("min", ["lowest", "minimum", "min ", "cheapest", "smallest", "paid the least"]),
     ]
 
-    def classify(self, text: str, analysis: dict | None = None) -> dict:
+    def classify(self, text: str, analysis: dict | None = None, entities: dict | None = None) -> dict:
         t = text.lower()
+        t = text.lower()
+        # Handle 'SELCET' typo and generic SELECT hints
+        t = t.replace("selcet", "select")
 
         intent: dict = {
             "original_text": text,
@@ -61,6 +61,9 @@ class IntentClassifier:
         )
         if m:
             intent["limit"] = int(next(g for g in m.groups() if g))
+        elif "all" in t or "*" in t:
+             if any(w in t for w in ("show", "list", "get", "display", "select")):
+                 intent["all_columns"] = True # Explicit hint for SELECT *
 
         # ---- TEMPORAL ----------------------------------------------------
         if analysis:
@@ -84,17 +87,37 @@ class IntentClassifier:
         else:
             # Explicit aggregation keywords
             for func, phrases in self._AGG_PATTERNS:
-                if any(p in t for p in phrases):
+                # Use word boundaries to avoid 'phone number' matching 'number'
+                pattern = r"\b(" + "|".join(re.escape(p) for p in phrases) + r")\b"
+                m_agg = re.search(pattern, t)
+                if m_agg:
+                    # print(f"DEBUG: matched agg {func} on word {m_agg.group(0)}")
                     intent["aggregation"] = func
                     break
 
-            # ---- HAVING --------------------------------------------------
-            # Only set HAVING when there's also a GROUP BY hint,
-            # otherwise it's a simple WHERE filter.
-            if analysis and analysis.get("having_hint") and intent["group_by_hint"]:
-                intent["having"] = analysis["having_hint"]
-                if not intent["aggregation"]:
-                    intent["aggregation"] = "count"
+            if analysis and analysis.get("having_hint"):
+                # Detect aggregation indicators (but avoid literal table names like 'employees')
+                has_agg_signal = (
+                    intent["group_by_hint"] or 
+                    any(w in t for w in ("number", "count", "many", "total", "sum", "records", "employees", "people"))
+                )
+
+                # Collision check: If the value in having_hint is already used as a WHERE filter, 
+                # e.g., 'salary > 70000', skip the HAVING logic unless it's a clear 'group by' query.
+                if entities and not intent["group_by_hint"]:
+                    # Clean the value for robust comparison
+                    val_str = str(analysis["having_hint"]["value"]).strip().strip(",").strip(".")
+                    if any(str(f["value"]).strip() == val_str for f in entities.get("filters", [])):
+                        has_agg_signal = False
+
+                if has_agg_signal:
+                    intent["having"] = analysis["having_hint"]
+                    if not intent["aggregation"]:
+                        # Treat 'highest number of' as count, not max
+                        if "number" in t or "many" in t:
+                             intent["aggregation"] = "count"
+                        else:
+                             intent["aggregation"] = "count"
 
             # Infer from "most X" pattern
             if not intent["aggregation"]:
@@ -105,21 +128,22 @@ class IntentClassifier:
 
         # ---- ORDER BY (if not already set) --------------------------------
         if not intent["order_by"]:
-            # Only match contextual order words, not "highest/lowest" when
-            # they are used for aggregation (those are already handled)
-            if intent["aggregation"] in ("max", "min"):
-                pass  # don't add ORDER BY for pure MAX()/MIN()
-            else:
-                desc_words = ("highest", "most", "largest", "top", "descending",
-                              "desc", "best", "greatest")
-                asc_words  = ("lowest", "least", "smallest", "cheapest",
-                              "ascending", "asc", "alphabetically", "oldest")
-                if any(w in t for w in desc_words):
-                    intent["order_by"] = "DESC"
-                elif any(w in t for w in asc_words):
-                    intent["order_by"] = "ASC"
-                elif intent["limit"]:
-                    intent["order_by"] = "DESC"
+            desc_words = ("highest", "most", "largest", "top", "descending", "desc", "best", "greatest")
+            asc_words  = ("lowest", "least", "smallest", "cheapest", "ascending", "asc", "alphabetically", "oldest")
+            
+            if any(w in t for w in desc_words):
+                intent["order_by"] = "DESC"
+            elif any(w in t for w in asc_words):
+                intent["order_by"] = "ASC"
+            elif intent["limit"]:
+                intent["order_by"] = "DESC"
+
+            # SPECIAL CASE: 'Top N highest' means ranking, not max()
+            agg_val = (intent.get("aggregation") or "").lower()
+            if (intent.get("limit") or 0) > 0 and agg_val in ("max", "min"):
+                 intent["aggregation"] = None
+                 if not intent["order_by"]:
+                     intent["order_by"] = "DESC" if agg_val == "max" else "ASC"
 
         return intent
 
@@ -136,14 +160,17 @@ class EntityExtractor:
     FUZZY_THRESHOLD = 78
     COLUMN_FUZZY_THRESHOLD = 85  # Higher threshold for column matching to avoid false positives
 
-    def __init__(self, metadata):
+    def __init__(self, metadata, linguist: DatabaseLinguist | None = None):
         if isinstance(metadata, str):
             with open(metadata, "r") as f:
                 self.metadata = json.load(f)
         else:
             self.metadata = metadata
 
+        self.linguist = linguist  # Direct DB access for 'fine-tuned' accuracy
+
         self.tables: dict[str, dict] = self.metadata.get("tables", {})
+        self.db_url = self.metadata.get("db_url") # Store for dynamic context if available
 
         # Pre-index: column_name → {data_type, description, sample, distinct, table}
         self._col_index: dict[str, dict] = {}
@@ -162,7 +189,7 @@ class EntityExtractor:
                     "data_type": col_meta.get("data_type", "text"),
                     "description": col_meta.get("description", col_name),
                     "sample_values": col_meta.get("sample_values", []),
-                    "distinct_values": col_meta.get("distinct_values", []),
+                    "distinct_values": col_meta.get("distinct_values", col_meta.get("sample_values", [])),
                     "is_primary_key": col_meta.get("is_primary_key", False),
                 }
                 self._all_col_names.append(col_name)
@@ -184,9 +211,21 @@ class EntityExtractor:
     # ------------------------------------------------------------------ #
     def extract(self, analysis: dict, text: str) -> dict:
         t = text.lower()
+        # Pre-process: merge 'i d' back into 'id' if spacy split it
+        t = t.replace(" i d ", " id ").replace(" i.d. ", " id ").replace("name and id", "name id")
+        
         nouns = analysis.get("nouns", [])
-        values = analysis.get("values", [])
+        if "id" not in nouns and ("id" in t or " i d " in t):
+             nouns.append("id")
 
+        # Include both detected values and other potential entities (GPE, etc.)
+        raw_vals = analysis.get("values", [])
+        values = [v for v in raw_vals if len(v["text"]) > 1 or v["text"].isdigit()]
+        
+        # ---- Optional: Log the DB context used for this query ----
+        if self.linguist:
+            context = self.linguist.get_context_summary()
+            
         # ---- 1. Resolve the single table ---------------------------------
         table = self._resolve_table(t, nouns, values)
         if not table:
@@ -202,20 +241,51 @@ class EntityExtractor:
         filters += self._extract_like_filters(t, table)
         filters = self._dedupe_filters(filters)
 
-        # ---- 3. Resolve SELECT columns -----------------------------------
+        # ---- 3. Resolve temporal filters (Dates) -------------------------
+        temp = analysis.get("temporal_filter")
+        if temp:
+            # Smart find: match column keywords like 'hired', 'born', 'joined'
+            date_col = None
+            date_cols = [c for c, m in table_cols.items() if m.get("data_type") in ("date", "timestamp")]
+            # Priority 1: Match keyword in query to column label
+            # e.g. "hired" matches "hire_date"
+            for dc in date_cols:
+                # Priority: query words like 'hired' should match 'hire_date'
+                # Use a tighter match: check if column name contains root of word
+                if any(w[:4] in dc.lower() for w in t.split() if len(w) > 3):
+                    date_col = dc
+                    break
+            # Priority 2: Use first available
+            if not date_col and date_cols:
+                date_col = date_cols[0]
+            
+            if date_col:
+                filters.append({
+                    "column": date_col, "operator": temp.get("operator", ">"),
+                    "value": temp.get("value"), "table": table
+                })
+
+        # ---- 4. Resolve SELECT columns -----------------------------------
         columns = self._resolve_columns(t, nouns, table, table_cols, filters)
 
         # ---- 4. Handle "show all" / "list all" → SELECT * ----------------
-        if self._is_generic_show(t, table):
+        all_cols_hint = ("all" in t or "*" in t) and any(
+            w in t for w in ("show", "list", "get", "display", "select")
+        )
+        if self._is_generic_show(t, table) or all_cols_hint:
             filter_col_names = {f["column"] for f in filters}
             columns = [c for c in columns if c["column"] not in filter_col_names]
+            # If we didn't match any columns but it's a 'show all', we'll use *
+            if not columns:
+                columns = [{"column": "*", "table": table}]
 
-        return {
+        result = {
             "table":   table,
             "tables":  [table],
             "columns": columns,
             "filters": filters,
         }
+        return result
 
     # ------------------------------------------------------------------ #
     #  Table resolution
@@ -305,9 +375,20 @@ class EntityExtractor:
         for col in col_names:
             pattern = re.escape(col).replace(r"\_", r"[\s\_]")
             if re.search(r"\b" + pattern + r"\b", text):
-                if col not in filter_cols and not table_cols[col].get("is_primary_key"):
+                # Allow PK if explicitly mentioned in text
+                if col not in filter_cols:
                     if not any(c["column"] == col for c in matched):
                         matched.append({"column": col, "table": table})
+
+        # Match "id" or "identifier" to the Primary Key
+        if re.search(r"\b(id|identifier|pk)\b", text):
+            pk = None
+            for col, meta in table_cols.items():
+                if meta.get("is_primary_key"):
+                    pk = col
+                    break
+            if pk and not any(c["column"] == pk for c in matched):
+                matched.append({"column": pk, "table": table})
 
         # Fuzzy match nouns → column names (strict threshold)
         for noun in nouns:
@@ -344,6 +425,7 @@ class EntityExtractor:
             "least", "total", "average", "count", "sum", "max", "min",
             "number", "many", "few", "more", "less", "than", "above",
             "below", "over", "under", "between", "employee", "employees",
+            "name", "id", "data", "record", "list", "show", "i", "d"
         }
 
         for val_item in values:
@@ -353,6 +435,10 @@ class EntityExtractor:
             if val_lower in skip:
                 continue
             if val_text.replace(",", "").replace(".", "").lstrip("-").isdigit():
+                continue
+
+            # Skip if value is a noise word
+            if val_lower in skip:
                 continue
 
             # 1. Exact match in value index
@@ -373,7 +459,7 @@ class EntityExtractor:
                     score = fuzz.WRatio(val_lower, str(dv).lower())
                     if score > best_score and score >= 85:
                         best_col, best_val, best_score = col_name, dv, score
-            if best_col:
+            if best_col and best_score >= 90: # Higher bar for fuzzy values
                 filters.append({
                     "column": best_col, "operator": "=",
                     "value": str(best_val), "table": table,
@@ -383,29 +469,66 @@ class EntityExtractor:
 
     def _extract_filters_from_text_scan(self, text: str, table: str) -> list[dict]:
         """
-        Scan raw text for words that match distinct_values but were missed
-        by spaCy NER (e.g., 'male', 'female', 'IT', 'active').
+        Scan raw text for words that fuzzy match distinct_values natively.
+        Automatically bridges gaps like 'male' matching 'M'.
         """
         filters: list[dict] = []
         table_cols = self._cols_for_table(table)
+        words = [w.strip(".,;:?!") for w in text.split()]
+        skip = {
+            "all", "show", "list", "find", "get", "display", "the", "a",
+            "an", "each", "per", "every", "by", "of", "in", "on", "to",
+            "and", "or", "not", "is", "are", "was", "were", "who", "whom",
+            "which", "that", "top", "bottom", "first", "last", "most",
+            "least", "total", "average", "count", "sum", "max", "min",
+            "number", "many", "few", "more", "less", "than", "above",
+            "below", "over", "under", "between", "employee", "employees",
+            "name", "names", "email", "emails", "id", "data", "record", 
+            "from", "after", "before", "since", "until", "for", "with"
+        }
 
+        # 1. Exact sentence inclusion for multi-word values (e.g., 'New York')
         for col_name, col_meta in table_cols.items():
             for dv in col_meta.get("distinct_values", []):
                 dv_str = str(dv)
                 dv_lower = dv_str.lower()
-                # Must be at least 2 chars to avoid matching single letters
-                if len(dv_lower) < 2:
-                    continue
-                # Check if this distinct value appears as a whole word in text
-                if re.search(r"\b" + re.escape(dv_lower) + r"\b", text):
-                    if not any(
-                        f["column"] == col_name and f["value"] == dv_str
-                        for f in filters
-                    ):
-                        filters.append({
-                            "column": col_name, "operator": "=",
-                            "value": dv_str, "table": table,
-                        })
+                if " " in dv_lower and len(dv_lower) > 3:
+                     if dv_lower in text:
+                         if not any(f["column"] == col_name and f["value"] == dv_str for f in filters):
+                             filters.append({"column": col_name, "operator": "=", "value": dv_str, "table": table})
+
+        # 2. Find the absolute best mathematical match for each single word
+        for word in words:
+            w_lower = word.lower()
+            if len(w_lower) < 3 or w_lower in skip:
+                continue
+                
+            best_col = None
+            best_dv = None
+            best_score = 0
+            
+            for col_name, col_meta in table_cols.items():
+                for dv in col_meta.get("distinct_values", []):
+                    dv_str = str(dv)
+                    dv_lower = dv_str.lower()
+                    
+                    if len(dv_lower) == 1 and not w_lower.startswith(dv_lower):
+                        continue
+                        
+                    score = fuzz.WRatio(w_lower, dv_lower)
+                    if score > best_score:
+                        best_score = score
+                        best_col = col_name
+                        best_dv = dv_str
+
+            # Only accept the highest-scoring match if it meets our strict accuracy threshold
+            if best_score >= 88 and best_col and best_dv: 
+                # Avoid appending if a multi-word phrase already captured it
+                if not any(f["column"] == best_col and f["value"] == best_dv for f in filters):
+                    filters.append({
+                        "column": best_col, "operator": "=",
+                        "value": best_dv, "table": table,
+                    })
 
         return filters
 
@@ -415,8 +538,8 @@ class EntityExtractor:
         table_cols = self._cols_for_table(table)
 
         patterns = [
-            (r"(\w+)\s+(?:is\s+)?(?:greater than|more than|above|over|higher than|exceeds?|after|since|later than|>)\s+(\d[\d,\.]*)", ">"),
-            (r"(\w+)\s+(?:is\s+)?(?:less than|fewer than|below|under|lower than|before|prior to|earlier than|<)\s+(\d[\d,\.]*)", "<"),
+            (r"(\w+)\s+(?:is\s+)?(?:greater than|more than|above|over|higher than|exceeds?|>)\s+(\d[\d,\.]*)", ">"),
+            (r"(\w+)\s+(?:is\s+)?(?:less than|fewer than|below|under|lower than|<)\s+(\d[\d,\.]*)", "<"),
             (r"(\w+)\s+(?:is\s+)?(?:at least|>=)\s+(\d[\d,\.]*)", ">="),
             (r"(\w+)\s+(?:is\s+)?(?:at most|<=)\s+(\d[\d,\.]*)", "<="),
             (r"(\w+)\s*>\s*(\d[\d,\.]*)", ">"),
@@ -474,11 +597,7 @@ class EntityExtractor:
     #  Helpers
     # ------------------------------------------------------------------ #
     def _cols_for_table(self, table: str) -> dict[str, dict]:
-        tbl_info = self.tables.get(table, {})
-        cols = tbl_info.get("columns", {})
-        if isinstance(cols, list):
-            return {c: {"data_type": "text"} for c in cols}
-        return cols
+        return {k: v for k, v in self._col_index.items() if v.get("table") == table}
 
     def _resolve_col_hint(self, hint: str, table_cols: dict) -> str | None:
         hint_lower = hint.lower().replace(" ", "_")

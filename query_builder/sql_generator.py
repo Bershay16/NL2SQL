@@ -7,6 +7,7 @@ Uses metadata data_types to intelligently pick aggregation targets
 and GROUP BY columns.
 """
 
+import re
 from sqlglot import parse_one
 
 
@@ -110,27 +111,26 @@ class SQLGenerator:
             select_parts.extend(group_cols)
 
         elif columns:
-            # Explicit columns only
-            filter_cols = {f["column"] for f in filters}
+            # Explicit columns resolve
             for c in columns:
                 col = c["column"]
-                if col not in filter_cols and col not in select_parts:
+                if col not in select_parts:
                     select_parts.append(col)
-            # If all columns were filter columns, fall back to *
-            if not select_parts:
-                select_parts.append("*")
+            
+            # PROACTIVE: If we only have numeric/technical columns and it's a ranking 
+            # or sorted query, add identifying labels (first_name, etc.)
+            if (order or limit) and select_parts != ["*"]:
+                # Check if we have any identifying columns
+                has_label = any(s in self._label_cols.get(table, []) for s in select_parts)
+                has_pk = pk in select_parts
+                if not (has_label or has_pk):
+                    # Add first available label or PK
+                    labels = self._label_cols.get(table, [])
+                    if labels:
+                        select_parts.insert(0, labels[0])
+                    elif pk:
+                        select_parts.insert(0, pk)
 
-            # For ranking queries (ORDER+LIMIT), include label columns
-            # so we see WHO has the top salary, not just the salary value
-            if order and limit and select_parts != ["*"]:
-                all_numeric = all(
-                    col_types.get(s, "text") in ("numeric", "integer", "float", "money")
-                    for s in select_parts
-                )
-                if all_numeric:
-                    for lc in self._label_cols.get(table, []):
-                        if lc not in select_parts:
-                            select_parts.insert(0, lc)
         else:
             select_parts.append("*")
 
@@ -148,6 +148,10 @@ class SQLGenerator:
             op  = f["operator"]
             val = f["value"]
             col_type = col_types.get(col, "text")
+
+            # Normalize dates: "January 1, 2022" -> "2022-01-01"
+            if col_type in ("date", "timestamp"):
+                val = self._normalize_date_value(str(val))
 
             # Handle year filters for date/timestamp columns:
             # "hired > 2020" -> EXTRACT(YEAR FROM hire_date) > 2020
@@ -247,6 +251,39 @@ class SQLGenerator:
 
         # 3. Absolute fallback
         return "*"
+
+    def _normalize_date_value(self, val: str) -> str:
+        """Convert natural dates like 'January 1, 2022' to '2022-01-01'."""
+        month_map = {
+            "january": "01", "jan": "01",
+            "february": "02", "feb": "02",
+            "march": "03", "mar": "03",
+            "april": "04", "apr": "04",
+            "may": "05",
+            "june": "06", "jun": "06",
+            "july": "07", "jul": "07",
+            "august": "08", "aug": "08",
+            "september": "09", "sep": "09",
+            "october": "10", "oct": "10",
+            "november": "11", "nov": "11",
+            "december": "12", "dec": "12"
+        }
+        
+        # Regex for: Month Name (optional comma/space) Day (optional comma/space) Year
+        # Handles "January 1, 2022" or "jan 1 2022"
+        match = re.search(r"([a-z]{3,})\s+(\d{1,2}),?\s+(\d{4})", val.lower())
+        if match:
+            m_name, day, year = match.groups()
+            m_num = None
+            # Check full names and abbreviations
+            for name, num in month_map.items():
+                if m_name.startswith(name):
+                    m_num = num
+                    break
+            if m_num:
+                return f"{year}-{m_num}-{day.zfill(2)}"
+        
+        return val
 
     def _pick_group_cols(
         self, agg: str, columns: list[dict], filters: list[dict],

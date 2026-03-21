@@ -107,7 +107,7 @@ class NLParser:
         if any(w in text_lower for w in eq_words):
             analysis["comparisons"].append("equal")
 
-        # ---- HAVING hint ---------------------------------------------------
+        # ---- HAVING hint (counts) ------------------------------------------
         having_re = (
             r"(more than|fewer than|less than|greater than|"
             r"over|above|under|below|at least|exceeding)\s+(\d[\d,]*)"
@@ -116,14 +116,20 @@ class NLParser:
         if m:
             op_word = m.group(1)
             val = m.group(2).replace(",", "")
-            if any(w in op_word for w in ("more", "greater", "over",
-                                          "above", "least", "exceeding")):
-                op = ">"
-            else:
-                op = "<"
+            op = ">" if any(w in op_word for w in ("more", "greater", "over", "above", "least", "exceeding")) else "<"
             analysis["having_hint"] = {"op": op, "value": val}
 
-        # ---- temporal ------------------------------------------------------
+        # ---- Temporal (Relative Dates or Periodic) ------------------------
+        # Check for relative dates first (e.g. "after January 1, 2022")
+        # Regex captures month name, day, and year
+        date_re = r"(after|before|since|prior to|later than|earlier than|>=|<=|>|<)\s+([a-zA-Z]+\s+\d{1,2},?\s+\d{4})"
+        m_date = re.search(date_re, text_lower)
+        if m_date:
+            rel = m_date.group(1).lower()
+            op = ">" if any(w in rel for w in ("after", "since", "later", ">")) else "<"
+            analysis["temporal_filter"] = {"operator": op, "value": m_date.group(2)}
+
+        # Periodic group-by (e.g. "per year")
         if re.search(r"\b(each|per|every|by)\s+year\b", text_lower):
             analysis["temporal"] = "year"
         elif re.search(r"\b(each|per|every|by)\s+month\b", text_lower):
