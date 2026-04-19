@@ -91,6 +91,8 @@ class SQLGenerator:
         group_cols: list[str] = []
         agg_expr: str | None = None
 
+        select_all = entities.get("select_all", False)
+        
         if temporal:
             # "per year" / "per month"
             date_col = self._pick_date_col(table)
@@ -110,7 +112,7 @@ class SQLGenerator:
             )
             select_parts.extend(group_cols)
 
-        elif columns:
+        elif columns and not select_all:
             # Explicit columns resolve
             for c in columns:
                 col = c["column"]
@@ -124,11 +126,11 @@ class SQLGenerator:
                 has_label = any(s in self._label_cols.get(table, []) for s in select_parts)
                 has_pk = pk in select_parts
                 if not (has_label or has_pk):
-                    # Add first available label or PK
+                    # Only add label if we don't already have one and it's not a generic *
                     labels = self._label_cols.get(table, [])
-                    if labels:
+                    if labels and labels[0] not in select_parts:
                         select_parts.insert(0, labels[0])
-                    elif pk:
+                    elif pk and pk not in select_parts:
                         select_parts.insert(0, pk)
 
         else:
@@ -165,10 +167,12 @@ class SQLGenerator:
                 continue
 
             # Quote non-numeric values
-            if not str(val).lstrip("-").replace(".", "").replace(",", "").isdigit():
-                val = f"'{val}'"
-
-            where_conds.append(f"{col} {op} {val}")
+            if op not in ("IS NULL", "IS NOT NULL"):
+                if not str(val).lstrip("-").replace(".", "").replace(",", "").isdigit():
+                    val = f"'{val}'"
+                where_conds.append(f"{col} {op} {val}")
+            else:
+                where_conds.append(f"{col} {op}")
 
         # ---------------------------------------------------------------- #
         # 4. GROUP BY
@@ -202,7 +206,8 @@ class SQLGenerator:
         # ---------------------------------------------------------------- #
         # 7. Assemble
         # ---------------------------------------------------------------- #
-        parts = [f"SELECT {', '.join(select_parts)}"]
+        distinct_str = "DISTINCT " if intent.get("distinct") else ""
+        parts = [f"SELECT {distinct_str}{', '.join(select_parts)}"]
         parts.append(f"FROM {from_clause}")
 
         if where_conds:
@@ -317,10 +322,20 @@ class SQLGenerator:
         """Pick the best column for ORDER BY (prefer numeric)."""
         for c in columns:
             col = c["column"]
+            if col == "*":
+                continue
             dt = self._col_types.get(table, {}).get(col, "text")
             if dt in ("numeric", "integer", "float", "real", "money"):
                 return col
-        return columns[0]["column"]
+        
+        # If we only have *, pick first numeric or PK
+        if columns and columns[0]["column"] == "*":
+            nc = self._numeric_cols.get(table, [])
+            if nc: return nc[0]
+            pk = self._pk_col.get(table)
+            if pk: return pk
+
+        return columns[0]["column"] if columns else "*"
 
     def _pick_date_col(self, table: str) -> str:
         """Pick the best date/timestamp column."""

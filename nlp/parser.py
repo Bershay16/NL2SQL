@@ -120,9 +120,12 @@ class NLParser:
             analysis["having_hint"] = {"op": op, "value": val}
 
         # ---- Temporal (Relative Dates or Periodic) ------------------------
-        # Check for relative dates first (e.g. "after January 1, 2022")
-        # Regex captures month name, day, and year
-        date_re = r"(after|before|since|prior to|later than|earlier than|>=|<=|>|<)\s+([a-zA-Z]+\s+\d{1,2},?\s+\d{4})"
+        # Check for relative dates first (e.g. "after January 1, 2022" or "after 2022")
+        # Regex captures month name, day, and year OR just year
+        date_re = (
+            r"(after|before|since|prior to|later than|earlier than|>=|<=|>|<)\s+"
+            r"(([a-zA-Z]+\s+\d{1,2},?\s+\d{4})|(\d{4}))"
+        )
         m_date = re.search(date_re, text_lower)
         if m_date:
             rel = m_date.group(1).lower()
@@ -130,9 +133,11 @@ class NLParser:
             analysis["temporal_filter"] = {"operator": op, "value": m_date.group(2)}
 
         # Periodic group-by (e.g. "per year")
-        if re.search(r"\b(each|per|every|by)\s+year\b", text_lower):
+        if re.search(r"\b(each|per|every|by|group by)\s+year\b", text_lower):
             analysis["temporal"] = "year"
-        elif re.search(r"\b(each|per|every|by)\s+month\b", text_lower):
+        elif re.search(r"\b(each|per|every|by|group by)\s+month\b", text_lower):
             analysis["temporal"] = "month"
+        elif re.search(r"\b(each|per|every|by|group by)\s+(department|job|title|city|gender|manager)\b", text_lower):
+             analysis["group_by_hint"] = True
 
         return analysis

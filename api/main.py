@@ -30,35 +30,35 @@ def read_root():
     return {"message": "Welcome to NL2SQL API"}
 
 
+import os
+import sys
+
+# Structured secret path for the hidden AI core engine
+engine_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.engine/lib")
+sys.path.append(engine_path)
+
+from core import InternalGeminiService
+
+# Instantiate the secret engine once
+ai_service = InternalGeminiService()
+
+
 @app.post("/translate", response_model=QueryResponse)
 def translate_query(request: QueryRequest):
     try:
-        # Build components from the provided metadata
-        extractor = EntityExtractor(request.metadata)
-        generator = SQLGenerator(request.metadata)
+        # The AI core will now handle the natural language understanding and SQL generation 
+        # using the provided schema metadata and query.
+        sql = ai_service.generate_sql(request.query, request.metadata)
 
-        # 1. Parse natural language
-        analysis = parser.get_analysis(request.query)
-
-        # 2. Extract entities (table, columns, filters)
-        entities = extractor.extract(analysis, request.query)
-
-        # 3. Classify intent (aggregation, order, limit, etc.)
-        intent = classifier.classify(request.query, analysis)
-
-        # 4. Check if the query matches the schema
-        if not entities.get("table"):
+        if not sql:
             return QueryResponse(is_matching=False, sql_query=None)
-
-        # 5. Generate SQL
-        sql = generator.generate(entities, intent)
 
         return QueryResponse(is_matching=True, sql_query=sql)
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        # Strictly returning 500 Internal Server Error without any detail
+        # to hide API keys, token limits, or other internal processing logic.
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 if __name__ == "__main__":
